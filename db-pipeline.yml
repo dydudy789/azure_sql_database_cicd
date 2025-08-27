@@ -1,0 +1,249 @@
+name: $(Date:yyyyMMdd).$(Rev:r)
+
+trigger: none
+
+pr:
+  branches: { include: [ main ] }
+  paths: { include: [ 'src/**', '*.sqlproj', '*.yml' ] }
+
+parameters:
+- name: deployToDev
+  displayName: 'Deploy to DEV'
+  type: boolean
+  default: false
+- name: deployToProd
+  displayName: 'Deploy to PROD'
+  type: boolean
+  default: false
+
+variables:
+- group: Terraform-project-variables
+- name: AZURE_SERVICE_CONNECTION
+  value: 'sc-terraform-project-sub'
+- name: BuildConfiguration
+  value: 'Release'
+- name: SqlProjPath
+  value: 'terraform_project_sqldb.sqlproj'
+- name: ArtifactName
+  value: 'dacpac'
+
+stages:
+# ----------------------
+# Build + Validate
+# ----------------------
+- stage: Build
+  displayName: Build DACPAC & (optionally) Validate
+  jobs:
+  - job: Build
+    pool: { vmImage: 'windows-latest' }   # <-- Windows agent
+    steps:
+      - script: |
+          echo SOURCES = $(Build.SourcesDirectory)
+          dir $(Build.SourcesDirectory)
+          dir $(Build.SourcesDirectory)\src
+        displayName: 'List repo files (debug)'
+
+      - task: NuGetToolInstaller@1
+
+      - task: NuGetCommand@2
+        displayName: 'NuGet restore'
+        inputs:
+          command: 'restore'
+          restoreSolution: '$(SqlProjPath)'
+
+      - task: VSBuild@1
+        displayName: 'Build .sqlproj -> .dacpac (OutDir=Artifact staging)'
+        inputs:
+          solution: '$(SqlProjPath)'
+          configuration: '$(BuildConfiguration)'
+          platform: 'Any CPU'
+          msbuildArchitecture: 'x64'
+          msbuildArgs: >
+            /p:Configuration=$(BuildConfiguration)
+            /p:OutDir=$(Build.ArtifactStagingDirectory)\artifact\
+
+      - task: AzureCLI@2
+        displayName: 'Validate vs DEV (no deploy)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        inputs:
+          azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+          scriptType: pscore
+          scriptLocation: inlineScript
+          inlineScript: |
+            $ErrorActionPreference = 'Stop'
+            Write-Host "Validate target: $(DEV_SQL_SERVER) / $(DEV_SQL_DB)"
+            $principal = az account show --query user.name -o tsv
+            Write-Host "Principal: $principal"
+
+            $sp = 'C:\Program Files\Microsoft SQL Server\170\DAC\bin\SqlPackage.exe'
+            if (-not (Test-Path $sp)) {
+              $zip  = Join-Path $env:AGENT_TEMPDIRECTORY 'sqlpackage.zip'
+              $dest = Join-Path $env:AGENT_TEMPDIRECTORY 'sqlpackage'
+              Invoke-WebRequest -Uri 'https://aka.ms/sqlpackage-windows' -OutFile $zip
+              if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+              Expand-Archive $zip -DestinationPath $dest -Force
+              $sp = Join-Path $dest 'sqlpackage.exe'
+            }
+
+            $dacpac = Get-ChildItem "$(Build.ArtifactStagingDirectory)\artifact" -Filter *.dacpac -File | Select-Object -First 1
+            if (-not $dacpac) { throw "No DACPAC in $(Build.ArtifactStagingDirectory)\artifact." }
+            Get-FileHash -Algorithm SHA256 $dacpac.FullName | Format-List
+
+            $token = az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+            & $sp `
+              /Action:Script `
+              /SourceFile:"$($dacpac.FullName)" `
+              /TargetServerName:"$(DEV_SQL_SERVER)" `
+              /TargetDatabaseName:"$(DEV_SQL_DB)" `
+              /AccessToken:$token `
+              /p:BlockOnPossibleDataLoss=true `
+              /p:AllowIncompatiblePlatform=true `
+              /OutputPath:"$(Build.ArtifactStagingDirectory)\dev_predeploy.sql"
+            if ($LASTEXITCODE -ne 0) { throw "SqlPackage (Script) exited with $LASTEXITCODE" }
+
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: '$(Build.ArtifactStagingDirectory)'
+          artifact: '$(ArtifactName)'
+
+# ----------------------
+# Deploy to DEV (manual)
+# ----------------------
+- stage: Deploy_Dev
+  displayName: Deploy to DEV
+  dependsOn: Build
+  condition: and(succeeded(), eq(${{ parameters.deployToDev }}, true))
+  jobs:
+  - deployment: Dev
+    pool: { vmImage: 'windows-latest' }   # <-- force Windows agent
+    environment: 'dev-sql'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - download: current
+              artifact: '$(ArtifactName)'
+
+            - task: AzureCLI@2
+              displayName: 'Publish to DEV'
+              inputs:
+                azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+                scriptType: pscore
+                scriptLocation: inlineScript
+                inlineScript: |
+                  $ErrorActionPreference = 'Stop'
+                  Write-Host "Target server: $(DEV_SQL_SERVER)"
+                  Write-Host "Target database: $(DEV_SQL_DB)"
+                  $principal = az account show --query user.name -o tsv
+                  Write-Host "Using principal: $principal"
+
+                  $sp = 'C:\Program Files\Microsoft SQL Server\170\DAC\bin\SqlPackage.exe'
+                  if (-not (Test-Path $sp)) {
+                    $zip  = Join-Path $env:AGENT_TEMPDIRECTORY 'sqlpackage.zip'
+                    $dest = Join-Path $env:AGENT_TEMPDIRECTORY 'sqlpackage'
+                    Invoke-WebRequest -Uri 'https://aka.ms/sqlpackage-windows' -OutFile $zip
+                    if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+                    Expand-Archive $zip -DestinationPath $dest -Force
+                    $sp = Join-Path $dest 'sqlpackage.exe'
+                  }
+
+                  $root   = "$(Pipeline.Workspace)\$(ArtifactName)"
+                  $dacpac = Get-ChildItem "$root\artifact" -Filter *.dacpac -File | Select-Object -First 1
+                  if (-not $dacpac) { throw "DACPAC not found under '$root\artifact'." }
+                  Get-FileHash -Algorithm SHA256 $dacpac.FullName | Format-List
+
+                  $token = az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+
+                  & $sp `
+                    /Action:Publish `
+                    /SourceFile:"$($dacpac.FullName)" `
+                    /TargetServerName:"$(DEV_SQL_SERVER)" `
+                    /TargetDatabaseName:"$(DEV_SQL_DB)" `
+                    /AccessToken:$token `
+                    /p:BlockOnPossibleDataLoss=true `
+                    /p:AllowIncompatiblePlatform=true
+                  if ($LASTEXITCODE -ne 0) { throw "SqlPackage (Publish) exited with $LASTEXITCODE" }
+
+                  # Post-deploy verification
+                  Add-Type -AssemblyName System.Data
+                  $cs = "Server=$(DEV_SQL_SERVER);Database=$(DEV_SQL_DB);Encrypt=True;TrustServerCertificate=False;Connection Timeout=15"
+                  $conn = New-Object System.Data.SqlClient.SqlConnection $cs
+                  $conn.AccessToken = $token
+                  $conn.Open()
+                  $cmd = $conn.CreateCommand()
+                  $cmd.CommandText = "SELECT COUNT(*) FROM sys.tables WHERE name='Customers' AND schema_id = SCHEMA_ID('dbo');"
+                  $exists = $cmd.ExecuteScalar() -gt 0
+                  $conn.Close()
+                  Write-Host "Post-deploy check: dbo.Customers exists? $exists"
+                  if (-not $exists) { throw "dbo.Customers not found after publish." }
+
+# ----------------------
+# Deploy to PROD (manual)
+# ----------------------
+- stage: Deploy_Prod
+  displayName: Deploy to PROD
+  dependsOn: Build
+  condition: and(succeeded(), eq(${{ parameters.deployToProd }}, true))
+  jobs:
+  - deployment: Prod
+    pool: { vmImage: 'windows-latest' }   # <-- force Windows agent
+    environment: 'prod-sql'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - download: current
+              artifact: '$(ArtifactName)'
+
+            - task: AzureCLI@2
+              displayName: 'Publish to PROD'
+              inputs:
+                azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+                scriptType: pscore
+                scriptLocation: inlineScript
+                inlineScript: |
+                  $ErrorActionPreference = 'Stop'
+                  Write-Host "Target server: $(PROD_SQL_SERVER)"
+                  Write-Host "Target database: $(PROD_SQL_DB)"
+                  $principal = az account show --query user.name -o tsv
+                  Write-Host "Using principal: $principal"
+
+                  $sp = 'C:\Program Files\Microsoft SQL Server\170\DAC\bin\SqlPackage.exe'
+                  if (-not (Test-Path $sp)) {
+                    $zip  = Join-Path $env:AGENT_TEMPDIRECTORY 'sqlpackage.zip'
+                    $dest = Join-Path $env:AGENT_TEMPDIRECTORY 'sqlpackage'
+                    Invoke-WebRequest -Uri 'https://aka.ms/sqlpackage-windows' -OutFile $zip
+                    if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+                    Expand-Archive $zip -DestinationPath $dest -Force
+                    $sp = Join-Path $dest 'sqlpackage.exe'
+                  }
+
+                  $root   = "$(Pipeline.Workspace)\$(ArtifactName)"
+                  $dacpac = Get-ChildItem "$root\artifact" -Filter *.dacpac -File | Select-Object -First 1
+                  if (-not $dacpac) { throw "DACPAC not found under '$root\artifact'." }
+                  Get-FileHash -Algorithm SHA256 $dacpac.FullName | Format-List
+
+                  $token = az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+
+                  & $sp `
+                    /Action:Publish `
+                    /SourceFile:"$($dacpac.FullName)" `
+                    /TargetServerName:"$(PROD_SQL_SERVER)" `
+                    /TargetDatabaseName:"$(PROD_SQL_DB)" `
+                    /AccessToken:$token `
+                    /p:BlockOnPossibleDataLoss=true `
+                    /p:AllowIncompatiblePlatform=true
+                  if ($LASTEXITCODE -ne 0) { throw "SqlPackage (Publish) exited with $LASTEXITCODE" }
+
+                  # Post-deploy verification
+                  Add-Type -AssemblyName System.Data
+                  $cs = "Server=$(PROD_SQL_SERVER);Database=$(PROD_SQL_DB);Encrypt=True;TrustServerCertificate=False;Connection Timeout=15"
+                  $conn = New-Object System.Data.SqlClient.SqlConnection $cs
+                  $conn.AccessToken = $token
+                  $conn.Open()
+                  $cmd = $conn.CreateCommand()
+                  $cmd.CommandText = "SELECT COUNT(*) FROM sys.tables WHERE name='Customers' AND schema_id = SCHEMA_ID('dbo');"
+                  $exists = $cmd.ExecuteScalar() -gt 0
+                  $conn.Close()
+                  Write-Host "Post-deploy check (PROD): dbo.Customers exists? $exists"
+                  if (-not $exists) { throw "dbo.Customers not found in PROD after publish." }
