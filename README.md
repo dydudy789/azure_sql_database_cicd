@@ -99,9 +99,21 @@ PROD_SQL_DB     = <prod-db-name>
 
 * Run sqlpackage with /AccessToken: to publish to Dev
 
+
+
 ### Deploy to Prod ###
 
 * (Optional) Manual approval on the prod environment
 
 * Repeat the same publish step against Prod
+
+
+
+<img width="1874" height="992" alt="db-deployment-pipelines-toggle" src="https://github.com/user-attachments/assets/e33e492c-5925-4994-94a4-269a049c51e4" />
+
+<img width="1893" height="891" alt="db-deployment-pipelines-success" src="https://github.com/user-attachments/assets/2fd7bed4-3944-4f76-8875-6074a0a97b69" />
+
+
+
+
 
